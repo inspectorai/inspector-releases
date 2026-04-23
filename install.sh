@@ -7,6 +7,7 @@ INSTALL_ROOT="${INSPECTOR_INSTALL_ROOT:-${HOME}/.local/share/inspector}"
 BIN_DIR="${INSPECTOR_BIN_DIR:-${HOME}/.local/bin}"
 CONFIG_HOME="${INSPECTOR_CONFIG_HOME:-${HOME}/.inspector}"
 FORCE_CONFIG="${INSPECTOR_INSTALL_FORCE_CONFIG:-0}"
+temp_dir=""
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -96,9 +97,15 @@ ensure_path_hint() {
   esac
 }
 
+cleanup() {
+  if [[ -n "${temp_dir}" && -d "${temp_dir}" ]]; then
+    rm -rf "${temp_dir}"
+  fi
+}
+
 main() {
   local repo target manifest_url manifest version tag asset_name download_url
-  local checksums_url expected_sha temp_dir archive_path extract_root bundle_root
+  local checksums_url expected_sha archive_path extract_root bundle_root
   local releases_dir release_dir current_link config_dir installed_config bundle_config
 
   need_cmd curl
@@ -134,7 +141,6 @@ main() {
   fi
 
   temp_dir="$(mktemp -d)"
-  trap 'rm -rf "${temp_dir}"' EXIT
   archive_path="${temp_dir}/${asset_name}"
   extract_root="${temp_dir}/extract"
 
@@ -182,4 +188,5 @@ main() {
   ensure_path_hint
 }
 
+trap cleanup EXIT
 main "$@"
