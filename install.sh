@@ -59,6 +59,18 @@ checksum_for_asset() {
   '
 }
 
+manifest_sha256_for_asset() {
+  local asset_name="${1:?missing asset name}"
+  awk -v asset_name="${asset_name}" '
+    index($0, "\"name\": \"" asset_name "\"") { in_asset=1; next }
+    in_asset && /"name":/ { in_asset=0 }
+    in_asset && match($0, /"sha256":[[:space:]]*"([^"]+)"/, found) {
+      print found[1]
+      exit
+    }
+  '
+}
+
 verify_checksum() {
   local asset_path="${1:?missing asset path}"
   local expected="${2:?missing checksum}"
@@ -107,8 +119,13 @@ main() {
 
   echo "Resolving checksum for ${asset_name}..."
   expected_sha="$(
-    curl -fsSL "${checksums_url}" | checksum_for_asset "${asset_name}"
+    printf '%s\n' "${manifest}" | manifest_sha256_for_asset "${asset_name}"
   )"
+  if [[ -z "${expected_sha}" ]]; then
+    expected_sha="$(
+      curl -fsSL "${checksums_url}" | checksum_for_asset "${asset_name}"
+    )"
+  fi
   if [[ -z "${expected_sha}" ]]; then
     echo "Failed to find ${asset_name} in ${checksums_url}" >&2
     exit 1
