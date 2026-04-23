@@ -5,6 +5,8 @@ set -euo pipefail
 RELEASE_REPO="${INSPECTOR_RELEASE_REPO:-inspectorai/inspector-releases}"
 INSTALL_ROOT="${INSPECTOR_INSTALL_ROOT:-${HOME}/.local/share/inspector}"
 BIN_DIR="${INSPECTOR_BIN_DIR:-${HOME}/.local/bin}"
+CONFIG_HOME="${INSPECTOR_CONFIG_HOME:-${HOME}/.inspector}"
+FORCE_CONFIG="${INSPECTOR_INSTALL_FORCE_CONFIG:-0}"
 
 need_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -97,7 +99,7 @@ ensure_path_hint() {
 main() {
   local repo target manifest_url manifest version tag asset_name download_url
   local checksums_url expected_sha temp_dir archive_path extract_root bundle_root
-  local releases_dir release_dir current_link
+  local releases_dir release_dir current_link config_dir installed_config bundle_config
 
   need_cmd curl
   need_cmd tar
@@ -152,13 +154,26 @@ main() {
   releases_dir="${INSTALL_ROOT}/releases"
   release_dir="${releases_dir}/${version}"
   current_link="${INSTALL_ROOT}/current"
+  config_dir="${CONFIG_HOME}"
+  installed_config="${config_dir}/config.toml"
+  bundle_config="${release_dir}/config/config.toml"
 
-  mkdir -p "${releases_dir}"
+  mkdir -p "${releases_dir}" "${config_dir}"
   rm -rf "${release_dir}"
   mv "${bundle_root}" "${release_dir}"
 
   ln -sfn "${release_dir}" "${current_link}"
   ln -sfn "${current_link}/bin/inspector" "${BIN_DIR}/inspector"
+
+  if [[ -f "${bundle_config}" ]]; then
+    if [[ ! -f "${installed_config}" || "${FORCE_CONFIG}" == "1" ]]; then
+      cp "${bundle_config}" "${installed_config}"
+      echo "Installed Inspector config: ${installed_config}"
+    else
+      echo "Keeping existing Inspector config: ${installed_config}"
+      echo "Set INSPECTOR_INSTALL_FORCE_CONFIG=1 to replace it."
+    fi
+  fi
 
   echo
   echo "Inspector ${version} installed successfully."
