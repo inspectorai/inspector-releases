@@ -34,11 +34,28 @@ detect_target() {
     Linux:x86_64)
       printf 'x86_64-unknown-linux-gnu'
       ;;
+    Darwin:arm64)
+      printf 'aarch64-apple-darwin'
+      ;;
+    Darwin:x86_64)
+      printf 'x86_64-apple-darwin'
+      ;;
     *)
-      echo "Inspector installer currently supports Linux x86_64 only." >&2
+      echo "Inspector installer does not support ${os}/${arch}." >&2
       exit 1
       ;;
   esac
+}
+
+need_sha256_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    return
+  fi
+  echo "Missing required command: sha256sum or shasum" >&2
+  exit 1
 }
 
 extract_json_string() {
@@ -67,18 +84,30 @@ manifest_sha256_for_asset() {
   awk -v asset_name="${asset_name}" '
     index($0, "\"name\": \"" asset_name "\"") { in_asset=1; next }
     in_asset && /"name":/ { in_asset=0 }
-    in_asset && match($0, /"sha256":[[:space:]]*"([^"]+)"/, found) {
-      print found[1]
+    in_asset && /"sha256":/ {
+      line=$0
+      sub(/^.*"sha256"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
       exit
     }
   '
+}
+
+compute_sha256() {
+  local asset_path="${1:?missing asset path}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${asset_path}" | awk '{print $1}'
+    return
+  fi
+  shasum -a 256 "${asset_path}" | awk '{print $1}'
 }
 
 verify_checksum() {
   local asset_path="${1:?missing asset path}"
   local expected="${2:?missing checksum}"
   local actual
-  actual="$(sha256sum "${asset_path}" | awk '{print $1}')"
+  actual="$(compute_sha256 "${asset_path}")"
   if [[ "${actual}" != "${expected}" ]]; then
     echo "Checksum mismatch for ${asset_path}" >&2
     echo "Expected: ${expected}" >&2
@@ -110,7 +139,7 @@ main() {
 
   need_cmd curl
   need_cmd tar
-  need_cmd sha256sum
+  need_sha256_cmd
   need_cmd mktemp
 
   repo="$(normalize_repo "${RELEASE_REPO}")"
