@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 
 $ReleaseRepo = if ($env:INSPECTOR_RELEASE_REPO) { $env:INSPECTOR_RELEASE_REPO } else { "inspectorai/inspector-releases" }
 $QuietInstall = $env:INSPECTOR_INSTALL_QUIET -eq "1"
+$ConfigHome = if ($env:INSPECTOR_CONFIG_HOME) { $env:INSPECTOR_CONFIG_HOME } else { Join-Path $env:USERPROFILE ".inspector" }
 
 function Normalize-Repo {
     param([string]$Value)
@@ -139,6 +140,27 @@ function Install-Msi {
     throw "MSI installation failed with exit code $($Process.ExitCode). Log: $LogPath"
 }
 
+function Write-ProductionConfig {
+    param([string]$ConfigHome)
+
+    $ConfigPath = Join-Path $ConfigHome "config.toml"
+    $Config = @'
+inspector_base_url = "https://api.dev.inspectorai.pro/api"
+inspector_frontend_base_url = "https://dev.inspectorai.pro"
+inspector_auth_base_url = "https://auth.dev.inspectorai.pro/hydra"
+ai_local_ws_sso_url = "ws://127.0.0.1:8000/ws/sso"
+ai_runtime_ws_url = "wss://api.dev.inspectorai.pro/api/ai/runtime/ws"
+inspector_sso_fallback = true
+inspector_sso_force_old = false
+inspector_sso_force_new = false
+inspector_sso_timeout_secs = 300
+'@
+
+    New-Item -ItemType Directory -Path $ConfigHome -Force | Out-Null
+    Set-Content -LiteralPath $ConfigPath -Value $Config -Encoding ASCII
+    Write-Host "Installed Inspector production config: $ConfigPath"
+}
+
 $Repo = Normalize-Repo $ReleaseRepo
 $Target = Get-TargetTriple
 $ReleaseApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
@@ -185,6 +207,7 @@ try {
     }
 
     Install-Msi -InstallerPath $InstallerPath -Quiet $QuietInstall
+    Write-ProductionConfig -ConfigHome $ConfigHome
 
     Write-Host ""
     Write-Host "Inspector installed successfully."
