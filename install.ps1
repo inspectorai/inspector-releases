@@ -2,8 +2,10 @@ $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
 $ReleaseRepo = if ($env:INSPECTOR_RELEASE_REPO) { $env:INSPECTOR_RELEASE_REPO } else { "inspectorai/inspector-releases" }
-$QuietInstall = $env:INSPECTOR_INSTALL_QUIET -eq "1"
+$InstallRoot = if ($env:INSPECTOR_INSTALL_ROOT) { $env:INSPECTOR_INSTALL_ROOT } else { Join-Path $env:LOCALAPPDATA "Inspector" }
+$BinDir = if ($env:INSPECTOR_BIN_DIR) { $env:INSPECTOR_BIN_DIR } else { Join-Path $InstallRoot "bin" }
 $ConfigHome = if ($env:INSPECTOR_CONFIG_HOME) { $env:INSPECTOR_CONFIG_HOME } else { Join-Path $env:USERPROFILE ".inspector" }
+$ForceConfig = if ($env:INSPECTOR_INSTALL_FORCE_CONFIG) { $env:INSPECTOR_INSTALL_FORCE_CONFIG } else { "1" }
 
 function Normalize-Repo {
     param([string]$Value)
@@ -30,18 +32,6 @@ function Get-TargetTriple {
     }
 }
 
-function Invoke-GitHubApi {
-    param([string]$Uri)
-
-    return Invoke-RestMethod `
-        -UseBasicParsing `
-        -Uri $Uri `
-        -Headers @{
-            "Accept" = "application/vnd.github+json"
-            "User-Agent" = "inspector-installer"
-        }
-}
-
 function Get-ObjectPropertyValue {
     param(
         $Object,
@@ -56,27 +46,16 @@ function Get-ObjectPropertyValue {
     return $null
 }
 
-function Find-ReleaseAsset {
+function Find-ManifestAsset {
     param(
-        $Release,
-        [string]$AssetName
+        $Manifest,
+        [string]$Target
     )
 
-    foreach ($Asset in $Release.assets) {
-        if ((Get-ObjectPropertyValue -Object $Asset -Name "name") -eq $AssetName) {
+    foreach ($Asset in $Manifest.assets) {
+        if ((Get-ObjectPropertyValue -Object $Asset -Name "target") -eq $Target) {
             return $Asset
         }
-    }
-
-    return $null
-}
-
-function Get-ChecksumFromAssetDigest {
-    param($Asset)
-
-    $Digest = Get-ObjectPropertyValue -Object $Asset -Name "digest"
-    if ($Digest -and $Digest -match "^sha256:([0-9a-fA-F]{64})$") {
-        return $Matches[1].ToLowerInvariant()
     }
 
     return $null
@@ -106,45 +85,65 @@ function Remove-ExistingPath {
     }
 }
 
-function Install-Msi {
+function Add-UserPathEntry {
+    param([string]$Path)
+
+    $NormalizedPath = [IO.Path]::GetFullPath($Path).TrimEnd("\")
+    $CurrentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $Entries = @()
+    if ($CurrentUserPath) {
+        $Entries = $CurrentUserPath -split ";" | Where-Object { $_ }
+    }
+
+    foreach ($Entry in $Entries) {
+        if ([IO.Path]::GetFullPath($Entry).TrimEnd("\").Equals($NormalizedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            $env:Path = "$NormalizedPath;$env:Path"
+            return
+        }
+    }
+
+    $NewUserPath = if ($CurrentUserPath) { "$CurrentUserPath;$NormalizedPath" } else { $NormalizedPath }
+    [Environment]::SetEnvironmentVariable("Path", $NewUserPath, "User")
+    $env:Path = "$NormalizedPath;$env:Path"
+    Write-Host "Added Inspector to user PATH: $NormalizedPath"
+}
+
+function Write-InspectorShim {
     param(
-        [string]$InstallerPath,
-        [bool]$Quiet
+        [string]$BinDir,
+        [string]$InspectorExe
     )
 
-    $LogPath = Join-Path ([IO.Path]::GetTempPath()) ("inspector-msi-install-" + [guid]::NewGuid().ToString("N") + ".log")
-    $DisplayArg = if ($Quiet) { "/quiet" } else { "/passive" }
-    $ArgumentList = @(
-        "/i",
-        "`"$InstallerPath`"",
-        $DisplayArg,
-        "/norestart",
-        "/L*v",
-        "`"$LogPath`""
-    )
-
-    Write-Host "Starting Windows Installer..."
-    $Process = Start-Process -FilePath "msiexec.exe" -ArgumentList $ArgumentList -Wait -PassThru
-
-    if ($Process.ExitCode -eq 0) {
-        Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
-        return
-    }
-
-    if ($Process.ExitCode -eq 3010) {
-        Remove-Item -LiteralPath $LogPath -Force -ErrorAction SilentlyContinue
-        Write-Host "Inspector installed successfully. Windows reports a restart is required."
-        return
-    }
-
-    throw "MSI installation failed with exit code $($Process.ExitCode). Log: $LogPath"
+    New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
+    $ShimPath = Join-Path $BinDir "inspector.cmd"
+    $Shim = @"
+@echo off
+"$InspectorExe" %*
+"@
+    Set-Content -LiteralPath $ShimPath -Value $Shim -Encoding ASCII
+    return $ShimPath
 }
 
 function Write-ProductionConfig {
-    param([string]$ConfigHome)
+    param(
+        [string]$ConfigHome,
+        [string]$BundleConfigPath,
+        [string]$ForceConfig
+    )
 
     $ConfigPath = Join-Path $ConfigHome "config.toml"
-    $Config = @'
+    New-Item -ItemType Directory -Path $ConfigHome -Force | Out-Null
+
+    if ((Test-Path -LiteralPath $ConfigPath) -and $ForceConfig -ne "1") {
+        Write-Host "Keeping existing Inspector config: $ConfigPath"
+        Write-Host "Set INSPECTOR_INSTALL_FORCE_CONFIG=1 to replace it."
+        return
+    }
+
+    if (Test-Path -LiteralPath $BundleConfigPath) {
+        Copy-Item -LiteralPath $BundleConfigPath -Destination $ConfigPath -Force
+    } else {
+        $Config = @'
 inspector_base_url = "https://api.dev.inspectorai.pro/api"
 inspector_frontend_base_url = "https://dev.inspectorai.pro"
 inspector_auth_base_url = "https://auth.dev.inspectorai.pro/hydra"
@@ -155,39 +154,37 @@ inspector_sso_force_old = false
 inspector_sso_force_new = false
 inspector_sso_timeout_secs = 300
 '@
+        Set-Content -LiteralPath $ConfigPath -Value $Config -Encoding ASCII
+    }
 
-    New-Item -ItemType Directory -Path $ConfigHome -Force | Out-Null
-    Set-Content -LiteralPath $ConfigPath -Value $Config -Encoding ASCII
-    Write-Host "Installed Inspector production config: $ConfigPath"
+    Write-Host "Installed Inspector config: $ConfigPath"
 }
 
 $Repo = Normalize-Repo $ReleaseRepo
 $Target = Get-TargetTriple
-$ReleaseApiUrl = "https://api.github.com/repos/$Repo/releases/latest"
-$AssetName = "inspector-cli-$Target.msi"
+$ManifestUrl = "https://github.com/$Repo/releases/latest/download/release-manifest.json"
 $TempDir = Join-Path ([IO.Path]::GetTempPath()) ("inspector-install-" + [guid]::NewGuid().ToString("N"))
-$InstallerPath = Join-Path $TempDir $AssetName
 
 try {
     Write-Host "Fetching latest Inspector release metadata..."
-    $Release = Invoke-GitHubApi -Uri $ReleaseApiUrl
-    $Tag = Get-ObjectPropertyValue -Object $Release -Name "tag_name"
-    if (-not $Tag) {
-        throw "Latest release metadata is missing tag_name."
+    $Manifest = Invoke-RestMethod -UseBasicParsing -Uri $ManifestUrl
+    $Version = Get-ObjectPropertyValue -Object $Manifest -Name "version"
+    $Tag = Get-ObjectPropertyValue -Object $Manifest -Name "tag"
+    if (-not $Version -or -not $Tag) {
+        throw "Release manifest is missing version or tag."
     }
 
-    $Asset = Find-ReleaseAsset -Release $Release -AssetName $AssetName
+    $Asset = Find-ManifestAsset -Manifest $Manifest -Target $Target
     if (-not $Asset) {
-        throw "Latest release does not publish $AssetName yet."
+        throw "Latest release does not publish an Inspector bundle for $Target yet."
     }
 
-    $DownloadUrl = Get-ObjectPropertyValue -Object $Asset -Name "browser_download_url"
-    if (-not $DownloadUrl) {
-        $DownloadUrl = "https://github.com/$Repo/releases/download/$Tag/$AssetName"
+    $AssetName = Get-ObjectPropertyValue -Object $Asset -Name "name"
+    $DownloadUrl = Get-ObjectPropertyValue -Object $Asset -Name "url"
+    $ExpectedSha = Get-ObjectPropertyValue -Object $Asset -Name "sha256"
+    if (-not $AssetName -or -not $DownloadUrl) {
+        throw "Release manifest asset for $Target is missing name or url."
     }
-
-    Write-Host "Resolving checksum for $AssetName..."
-    $ExpectedSha = Get-ChecksumFromAssetDigest -Asset $Asset
     if (-not $ExpectedSha) {
         $ChecksumsUrl = "https://github.com/$Repo/releases/download/$Tag/SHA256SUMS.txt"
         $ExpectedSha = Get-ChecksumFromSumsFile -ChecksumsUrl $ChecksumsUrl -AssetName $AssetName
@@ -197,21 +194,50 @@ try {
     }
 
     New-Item -ItemType Directory -Path $TempDir -Force | Out-Null
+    $ArchivePath = Join-Path $TempDir $AssetName
+    $ExtractRoot = Join-Path $TempDir "extract"
 
     Write-Host "Downloading $AssetName..."
-    Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $InstallerPath
+    Invoke-WebRequest -UseBasicParsing -Uri $DownloadUrl -OutFile $ArchivePath
 
-    $ActualSha = (Get-FileHash -LiteralPath $InstallerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $ActualSha = (Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($ActualSha -ne $ExpectedSha.ToLowerInvariant()) {
         throw "Checksum mismatch for $AssetName. Expected $ExpectedSha, got $ActualSha."
     }
 
-    Install-Msi -InstallerPath $InstallerPath -Quiet $QuietInstall
-    Write-ProductionConfig -ConfigHome $ConfigHome
+    New-Item -ItemType Directory -Path $ExtractRoot -Force | Out-Null
+    Expand-Archive -LiteralPath $ArchivePath -DestinationPath $ExtractRoot -Force
+
+    $BundleRoot = Join-Path $ExtractRoot "inspector-bundle-$Version-$Target"
+    $BundleJson = Join-Path $BundleRoot "bundle.json"
+    if (-not (Test-Path -LiteralPath $BundleJson)) {
+        throw "Downloaded archive does not contain a valid Inspector bundle."
+    }
+
+    $ReleasesDir = Join-Path $InstallRoot "releases"
+    $ReleaseDir = Join-Path $ReleasesDir $Version
+    New-Item -ItemType Directory -Path $ReleasesDir -Force | Out-Null
+    Remove-ExistingPath -Path $ReleaseDir
+    Move-Item -LiteralPath $BundleRoot -Destination $ReleaseDir
+
+    $InspectorExe = Join-Path $ReleaseDir "bin\inspector.exe"
+    $AiLocalExe = Join-Path $ReleaseDir "runtime\ai_local\inspector-ai-local.exe"
+    if (-not (Test-Path -LiteralPath $InspectorExe)) {
+        throw "Installed bundle is missing $InspectorExe."
+    }
+    if (-not (Test-Path -LiteralPath $AiLocalExe)) {
+        throw "Installed bundle is missing $AiLocalExe."
+    }
+
+    $ShimPath = Write-InspectorShim -BinDir $BinDir -InspectorExe $InspectorExe
+    Add-UserPathEntry -Path $BinDir
+    Write-ProductionConfig -ConfigHome $ConfigHome -BundleConfigPath (Join-Path $ReleaseDir "config\config.toml") -ForceConfig $ForceConfig
 
     Write-Host ""
-    Write-Host "Inspector installed successfully."
-    Write-Host "Open a new shell before running 'inspector' if the installer updated PATH."
+    Write-Host "Inspector $Version installed successfully."
+    Write-Host "Binary: $ShimPath"
+    Write-Host "Bundle: $ReleaseDir"
+    Write-Host "Open a new shell before running 'inspector' if this is your first install."
 } finally {
     Remove-ExistingPath -Path $TempDir
 }
