@@ -116,14 +116,152 @@ verify_checksum() {
   fi
 }
 
-ensure_path_hint() {
+path_contains_bin_dir() {
   case ":${PATH}:" in
-    *":${BIN_DIR}:"*) ;;
+    *":${BIN_DIR}:"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+shell_quote() {
+  local value="${1:?missing value}"
+  printf "'%s'" "$(printf '%s' "${value}" | sed "s/'/'\\\\''/g")"
+}
+
+path_profile_snippet() {
+  local quoted_bin_dir
+  quoted_bin_dir="$(shell_quote "${BIN_DIR}")"
+  cat <<EOF
+# >>> inspector installer PATH >>>
+inspector_bin_dir=${quoted_bin_dir}
+case ":\${PATH}:" in
+  *":\${inspector_bin_dir}:"*) ;;
+  *) export PATH="\${inspector_bin_dir}:\${PATH}" ;;
+esac
+# <<< inspector installer PATH <<<
+EOF
+}
+
+fish_path_profile_snippet() {
+  local quoted_bin_dir
+  quoted_bin_dir="$(shell_quote "${BIN_DIR}")"
+  cat <<EOF
+# >>> inspector installer PATH >>>
+set -l inspector_bin_dir ${quoted_bin_dir}
+if not contains -- \$inspector_bin_dir \$PATH
+    set -gx PATH \$inspector_bin_dir \$PATH
+end
+# <<< inspector installer PATH <<<
+EOF
+}
+
+append_profile_snippet() {
+  local profile_path="${1:?missing profile path}"
+  local snippet="${2:?missing snippet}"
+  local profile_dir
+
+  if [[ -f "${profile_path}" ]] && grep -Fq "# >>> inspector installer PATH >>>" "${profile_path}"; then
+    return 1
+  fi
+
+  profile_dir="$(dirname "${profile_path}")"
+  mkdir -p "${profile_dir}"
+  touch "${profile_path}"
+  {
+    echo
+    printf '%s\n' "${snippet}"
+  } >>"${profile_path}"
+  return 0
+}
+
+profile_candidates() {
+  local shell_name os_name
+  shell_name="$(basename "${SHELL:-}")"
+  os_name="$(uname -s)"
+
+  case "${shell_name}" in
+    zsh)
+      printf '%s\n' "${HOME}/.zprofile" "${HOME}/.zshrc"
+      ;;
+    bash)
+      if [[ "${os_name}" == "Darwin" ]]; then
+        printf '%s\n' "${HOME}/.bash_profile"
+      fi
+      printf '%s\n' "${HOME}/.bashrc" "${HOME}/.profile"
+      ;;
+    fish)
+      printf '%s\n' "${HOME}/.config/fish/config.fish"
+      ;;
     *)
-      echo
-      echo "Add ${BIN_DIR} to your PATH to run 'inspector' directly." >&2
+      printf '%s\n' "${HOME}/.profile"
       ;;
   esac
+}
+
+link_into_existing_path_dir() {
+  local inspector_target="${1:?missing inspector target}"
+  local path_dir candidate
+
+  IFS=":" read -r -a path_dirs <<<"${PATH:-}"
+  for path_dir in "${path_dirs[@]}"; do
+    if [[ -z "${path_dir}" || ! -d "${path_dir}" || ! -w "${path_dir}" ]]; then
+      continue
+    fi
+    if [[ "${path_dir}" != "${HOME}/"* && "${path_dir}" != "/usr/local/bin" && "${path_dir}" != "/opt/homebrew/bin" ]]; then
+      continue
+    fi
+    if [[ "${path_dir}" == "${BIN_DIR}" ]]; then
+      continue
+    fi
+
+    candidate="${path_dir}/inspector"
+    if [[ -e "${candidate}" && ! -L "${candidate}" ]]; then
+      continue
+    fi
+
+    if ln -sfn "${inspector_target}" "${candidate}" 2>/dev/null; then
+      echo "Linked Inspector into PATH: ${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_user_path() {
+  local inspector_target="${1:?missing inspector target}"
+  local profile_path snippet updated_profiles=()
+
+  if path_contains_bin_dir; then
+    return
+  fi
+
+  if link_into_existing_path_dir "${inspector_target}"; then
+    return
+  fi
+
+  while IFS= read -r profile_path; do
+    if [[ -z "${profile_path}" ]]; then
+      continue
+    fi
+    if [[ "${profile_path}" == */config.fish ]]; then
+      snippet="$(fish_path_profile_snippet)"
+    else
+      snippet="$(path_profile_snippet)"
+    fi
+    if append_profile_snippet "${profile_path}" "${snippet}"; then
+      updated_profiles+=("${profile_path}")
+    fi
+  done < <(profile_candidates)
+
+  if ((${#updated_profiles[@]} > 0)); then
+    echo "Added Inspector to PATH for new shells:"
+    for profile_path in "${updated_profiles[@]}"; do
+      echo "  ${profile_path}"
+    done
+  else
+    echo "Inspector PATH profile entry already exists."
+  fi
 }
 
 cleanup() {
@@ -199,6 +337,7 @@ main() {
 
   ln -sfn "${release_dir}" "${current_link}"
   ln -sfn "${current_link}/bin/inspector" "${BIN_DIR}/inspector"
+  ensure_user_path "${current_link}/bin/inspector"
 
   if [[ -f "${bundle_config}" ]]; then
     if [[ ! -f "${installed_config}" || "${FORCE_CONFIG}" == "1" ]]; then
@@ -214,7 +353,6 @@ main() {
   echo "Inspector ${version} installed successfully."
   echo "Binary: ${BIN_DIR}/inspector"
   echo "Bundle: ${release_dir}"
-  ensure_path_hint
 }
 
 trap cleanup EXIT
